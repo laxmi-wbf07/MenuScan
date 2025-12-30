@@ -1,0 +1,417 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1,user-scalable=no">
+<meta name="description" content="Interactive restaurant menu with offline support">
+<meta name="theme-color" content="#000">
+<title>Menu</title>
+<style>
+*{margin:0;padding:0;box-sizing:border-box}
+body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;overflow:hidden;background:#000;color:#fff;-webkit-user-select:none;user-select:none}
+#header{position:fixed;top:0;left:0;right:0;z-index:100;padding:1rem;background:rgba(0,0,0,.8);backdrop-filter:blur(10px);display:flex;justify-content:space-between;align-items:center}
+#header h1{font-size:1.2rem;font-weight:600}
+#fav-counter{font-size:1rem;padding:.5rem 1rem;background:rgba(255,255,255,.1);border-radius:20px}
+#container{display:flex;height:100vh;overflow-x:scroll;scroll-snap-type:x mandatory;scroll-behavior:smooth;-webkit-overflow-scrolling:touch;scrollbar-width:none}
+#container::-webkit-scrollbar{display:none}
+.card{min-width:100vw;width:100vw;height:100vh;scroll-snap-align:center;position:relative;perspective:1000px;cursor:pointer}
+.card-inner{width:100%;height:100%;position:relative;transform-style:preserve-3d;transition:transform .6s cubic-bezier(.4,0,.2,1)}
+.card.flipped .card-inner{transform:rotateY(180deg)}
+.card-face{position:absolute;width:100%;height:100%;backface-visibility:hidden;display:flex;flex-direction:column;justify-content:center;align-items:center;overflow:hidden}
+.card-front{background:#000}
+.card-back{background:#1a1a1a;transform:rotateY(180deg);padding:4rem 2rem}
+.img-wrapper{width:100%;height:100%;position:relative;overflow:hidden}
+.dish-img{width:100%;height:100%;object-fit:cover;transition:transform 20s ease-out}
+.card.snapped .dish-img{transform:scale(1.15) translate(2%,2%)}
+.dish-name{position:absolute;bottom:2rem;left:2rem;right:2rem;font-size:2.5rem;font-weight:700;text-shadow:0 4px 20px rgba(0,0,0,.8);z-index:10;padding:.5rem 1rem;border-radius:8px}
+.dish-price{position:absolute;top:6rem;right:2rem;font-size:2rem;font-weight:700;padding:.5rem 1rem;border-radius:8px;text-shadow:0 2px 10px rgba(0,0,0,.8)}
+.fav-badge{position:absolute;top:6rem;left:2rem;font-size:2rem;padding:.5rem;background:rgba(255,255,255,.2);border-radius:50%;min-width:3rem;text-align:center;backdrop-filter:blur(5px)}
+.back-content{max-width:600px;text-align:center}
+.back-content h2{font-size:2rem;margin-bottom:1rem}
+.back-content .price{font-size:1.5rem;color:#888;margin-bottom:1.5rem}
+.back-content .desc{font-size:1.2rem;line-height:1.6;margin-bottom:1.5rem;color:#ccc}
+.tags{font-size:2rem;margin-bottom:1.5rem}
+.calorie-bar{width:100%;height:8px;background:rgba(255,255,255,.1);border-radius:4px;overflow:hidden;margin-bottom:1rem}
+.calorie-fill{height:100%;background:linear-gradient(90deg,#4ade80,#fbbf24,#ef4444);border-radius:4px;transition:width .3s}
+.chef-hack{margin-top:1.5rem;padding:1rem;background:rgba(255,215,0,.1);border-left:3px solid gold;font-size:.9rem;font-style:italic;color:#ffd700;text-align:left;opacity:0;animation:reveal .5s forwards}
+@keyframes reveal{to{opacity:1}}
+.placeholder{width:100%;height:100%;display:flex;align-items:center;justify-content:center;font-size:1.5rem;color:#666}
+@media(prefers-reduced-motion:reduce){*{animation:none!important;transition:none!important}.card-inner{transition:transform .3s}}
+</style>
+</head>
+<body>
+<header id="header" role="banner">
+<h1>Menu</h1>
+<div id="fav-counter" role="status" aria-live="polite">⭐ <span id="fav-count">0</span></div>
+</header>
+<main id="container" role="main" aria-label="Menu dishes"></main>
+<script>
+(function(){
+'use strict';
+const APP={db:null,dishes:[],menuUrl:window.location.origin+'/menu.md',lastEtag:null};
+
+function log(msg){console.log('[Menu]',msg)}
+
+async function initDB(){
+return new Promise((resolve,reject)=>{
+const req=indexedDB.open('MenuDB',1);
+req.onerror=()=>reject(req.error);
+req.onsuccess=()=>{APP.db=req.result;resolve()};
+req.onupgradeneeded=e=>{
+const db=e.target.result;
+if(!db.objectStoreNames.contains('dishes')){
+db.createObjectStore('dishes',{keyPath:'id'});
+}
+if(!db.objectStoreNames.contains('meta')){
+db.createObjectStore('meta',{keyPath:'key'});
+}
+};
+});
+}
+
+function parseMenuMd(text){
+const lines=text.split('\n').filter(l=>l.trim()&&l.startsWith('##'));
+return lines.map((line,idx)=>{
+const parts=line.substring(2).split('|').map(p=>p.trim());
+if(parts.length<4)return null;
+return{
+id:idx+1,
+name:parts[0],
+price:parts[1],
+description:parts[2],
+emoji:parts[2].match(/[\u{1F000}-\u{1F9FF}]/u)?.[0]||'',
+imageUrl:parts[3],
+favorites:0,
+color:'#4a5568'
+};
+}).filter(Boolean);
+}
+
+async function fetchMenu(){
+try{
+let url=APP.menuUrl;
+if(window.location.protocol==='file:'){
+url='menu.md';
+}
+const resp=await fetch(url,{cache:'no-cache'});
+if(!resp.ok)throw new Error('Failed to fetch');
+const etag=resp.headers.get('etag')||resp.headers.get('last-modified')||'';
+const text=await resp.text();
+return{text,etag};
+}catch(e){
+log('Fetch failed: '+e.message);
+return null;
+}
+}
+
+async function storeDishes(dishes){
+const tx=APP.db.transaction(['dishes'],'readwrite');
+const store=tx.objectStore('dishes');
+dishes.forEach(d=>store.put(d));
+return new Promise((resolve,reject)=>{
+tx.oncomplete=()=>resolve();
+tx.onerror=()=>reject(tx.error);
+});
+}
+
+async function loadDishesFromDB(){
+return new Promise((resolve,reject)=>{
+const tx=APP.db.transaction(['dishes'],'readonly');
+const store=tx.objectStore('dishes');
+const req=store.getAll();
+req.onsuccess=()=>resolve(req.result||[]);
+req.onerror=()=>reject(req.error);
+});
+}
+
+async function getMeta(key){
+return new Promise(resolve=>{
+const tx=APP.db.transaction(['meta'],'readonly');
+const req=tx.objectStore('meta').get(key);
+req.onsuccess=()=>resolve(req.result?.value);
+req.onerror=()=>resolve(null);
+});
+}
+
+async function setMeta(key,value){
+return new Promise(resolve=>{
+const tx=APP.db.transaction(['meta'],'readwrite');
+tx.objectStore('meta').put({key,value});
+tx.oncomplete=()=>resolve();
+tx.onerror=()=>resolve();
+});
+}
+
+async function updateDish(dish){
+return new Promise((resolve,reject)=>{
+const tx=APP.db.transaction(['dishes'],'readwrite');
+const req=tx.objectStore('dishes').put(dish);
+req.onsuccess=()=>resolve();
+req.onerror=()=>reject(req.error);
+});
+}
+
+function extractPalette(img){
+const canvas=document.createElement('canvas');
+const ctx=canvas.getContext('2d');
+canvas.width=img.naturalWidth||img.width;
+canvas.height=img.naturalHeight||img.height;
+ctx.drawImage(img,0,0);
+const samples=[
+[10,10],[canvas.width-10,10],[canvas.width/2,canvas.height/2],
+[10,canvas.height-10],[canvas.width-10,canvas.height-10]
+];
+let r=0,g=0,b=0,count=0;
+samples.forEach(([x,y])=>{
+try{
+const data=ctx.getImageData(x,y,1,1).data;
+r+=data[0];g+=data[1];b+=data[2];count++;
+}catch(e){}
+});
+if(count===0)return'#4a5568';
+r=Math.floor(r/count);g=Math.floor(g/count);b=Math.floor(b/count);
+const brightness=(r*299+g*587+b*114)/1000;
+if(brightness>200){r=Math.floor(r*.6);g=Math.floor(g*.6);b=Math.floor(b*.6)}
+return`rgb(${r},${g},${b})`;
+}
+
+function renderDishes(dishes){
+const container=document.getElementById('container');
+container.innerHTML='';
+if(!dishes.length){
+container.innerHTML='<div class="placeholder">No dishes available</div>';
+return;
+}
+APP.dishes=dishes;
+updateFavCounter();
+dishes.forEach((dish,idx)=>{
+const card=document.createElement('div');
+card.className='card';
+card.setAttribute('role','article');
+card.setAttribute('aria-label',dish.name);
+card.dataset.id=dish.id;
+const inner=document.createElement('div');
+inner.className='card-inner';
+const front=document.createElement('div');
+front.className='card-face card-front';
+const imgWrapper=document.createElement('div');
+imgWrapper.className='img-wrapper';
+const img=document.createElement('img');
+img.className='dish-img';
+img.alt=dish.name;
+img.loading=idx>1?'lazy':'eager';
+img.dataset.src=dish.imageUrl;
+const dishName=document.createElement('div');
+dishName.className='dish-name';
+dishName.textContent=dish.name;
+dishName.style.background=`linear-gradient(135deg,${dish.color}dd,${dish.color}66)`;
+const dishPrice=document.createElement('div');
+dishPrice.className='dish-price';
+dishPrice.textContent=dish.price;
+dishPrice.style.background=`${dish.color}cc`;
+if(dish.favorites>0){
+const favBadge=document.createElement('div');
+favBadge.className='fav-badge';
+favBadge.textContent=`⭐${dish.favorites}`;
+front.appendChild(favBadge);
+}
+imgWrapper.appendChild(img);
+front.appendChild(imgWrapper);
+front.appendChild(dishName);
+front.appendChild(dishPrice);
+const back=document.createElement('div');
+back.className='card-face card-back';
+back.innerHTML=`
+<div class="back-content">
+<h2>${dish.name}</h2>
+<div class="price">${dish.price}</div>
+<div class="desc">${dish.description}</div>
+<div class="tags">${dish.emoji||'🍽️'}</div>
+<div class="calorie-bar"><div class="calorie-fill" style="width:${35+idx*10}%"></div></div>
+${dish.favorites>=5?`<div class="chef-hack">👨‍🍳 Chef's Hack: ${getChefHack(dish.name)}</div>`:''}
+</div>
+`;
+back.style.background=`linear-gradient(135deg,#1a1a1a,${dish.color}22)`;
+inner.appendChild(front);
+inner.appendChild(back);
+card.appendChild(inner);
+container.appendChild(card);
+img.addEventListener('load',()=>{
+if(!dish.color||dish.color==='#4a5568'){
+const color=extractPalette(img);
+dish.color=color;
+dishName.style.background=`linear-gradient(135deg,${color}dd,${color}66)`;
+dishPrice.style.background=`${color}cc`;
+back.style.background=`linear-gradient(135deg,#1a1a1a,${color}22)`;
+updateDish(dish);
+}
+});
+img.src=img.dataset.src;
+});
+setupInteractions();
+setupScrollSnap();
+}
+
+function getChefHack(name){
+const hacks={
+'Margherita Pizza':'Let dough rest 24h for best texture',
+'Caesar Salad':'Add anchovy paste to boost umami',
+'Grilled Salmon':'Skin-side down first for crispy skin',
+'Truffle Pasta':'Finish with truffle oil off heat',
+'Ribeye Steak':'Rest 5min after cooking for juicy meat',
+'Chocolate Lava Cake':'Underbake by 1min for molten center'
+};
+return hacks[name]||'Quality ingredients make all the difference';
+}
+
+function setupInteractions(){
+const cards=document.querySelectorAll('.card');
+const tapHandler=createTapHandler();
+cards.forEach(card=>{
+card.addEventListener('click',e=>{
+e.preventDefault();
+tapHandler(card);
+});
+card.addEventListener('keydown',e=>{
+if(e.key==='Enter'||e.key===' '){
+e.preventDefault();
+card.classList.toggle('flipped');
+}else if(e.key==='f'||e.key==='F'){
+e.preventDefault();
+handleFavorite(card);
+}
+});
+card.setAttribute('tabindex','0');
+});
+}
+
+function createTapHandler(){
+let lastTap=0;
+let tapTarget=null;
+return function(card){
+const now=Date.now();
+const timeSince=now-lastTap;
+if(timeSince<300&&tapTarget===card){
+handleFavorite(card);
+lastTap=0;
+tapTarget=null;
+}else{
+card.classList.toggle('flipped');
+lastTap=now;
+tapTarget=card;
+}
+};
+}
+
+async function handleFavorite(card){
+const id=parseInt(card.dataset.id);
+const dish=APP.dishes.find(d=>d.id===id);
+if(!dish)return;
+dish.favorites++;
+await updateDish(dish);
+updateFavCounter();
+const inner=card.querySelector('.card-inner');
+const wasFlipped=card.classList.contains('flipped');
+if(wasFlipped)card.classList.remove('flipped');
+setTimeout(()=>{
+renderDishes(APP.dishes);
+if(wasFlipped){
+const newCard=document.querySelector(`[data-id="${id}"]`);
+if(newCard)newCard.classList.add('flipped');
+}
+},50);
+}
+
+function updateFavCounter(){
+const total=APP.dishes.reduce((sum,d)=>sum+d.favorites,0);
+document.getElementById('fav-count').textContent=total;
+}
+
+function setupScrollSnap(){
+const container=document.getElementById('container');
+const observer=new IntersectionObserver(entries=>{
+entries.forEach(entry=>{
+if(entry.isIntersecting){
+entry.target.classList.add('snapped');
+}else{
+entry.target.classList.remove('snapped');
+}
+});
+},{threshold:.5});
+document.querySelectorAll('.card').forEach(card=>observer.observe(card));
+document.addEventListener('keydown',e=>{
+const scrollAmount=window.innerWidth;
+if(e.key==='ArrowRight'){
+e.preventDefault();
+container.scrollBy({left:scrollAmount,behavior:'smooth'});
+}else if(e.key==='ArrowLeft'){
+e.preventDefault();
+container.scrollBy({left:-scrollAmount,behavior:'smooth'});
+}
+});
+}
+
+async function syncMenuIfChanged(){
+const data=await fetchMenu();
+if(!data)return;
+const lastEtag=await getMeta('etag');
+if(data.etag&&lastEtag&&data.etag===lastEtag){
+log('Menu unchanged');
+return;
+}
+const dishes=parseMenuMd(data.text);
+if(dishes.length>0){
+const existing=await loadDishesFromDB();
+const favMap=new Map(existing.map(d=>[d.name,{favorites:d.favorites,color:d.color}]));
+dishes.forEach(d=>{
+const prev=favMap.get(d.name);
+if(prev){
+d.favorites=prev.favorites;
+d.color=prev.color;
+}
+});
+await storeDishes(dishes);
+await setMeta('etag',data.etag);
+log('Menu updated');
+renderDishes(dishes);
+}
+}
+
+async function init(){
+try{
+await initDB();
+log('IndexedDB ready');
+const cached=await loadDishesFromDB();
+if(cached.length>0){
+log(`Loaded ${cached.length} dishes from cache`);
+renderDishes(cached);
+syncMenuIfChanged();
+}else{
+log('First visit, fetching menu');
+const data=await fetchMenu();
+if(!data){
+renderDishes([]);
+return;
+}
+const dishes=parseMenuMd(data.text);
+if(dishes.length>0){
+await storeDishes(dishes);
+await setMeta('etag',data.etag);
+renderDishes(dishes);
+}
+}
+}catch(e){
+log('Error: '+e.message);
+document.getElementById('container').innerHTML='<div class="placeholder">Error loading menu</div>';
+}
+}
+
+if(document.readyState==='loading'){
+document.addEventListener('DOMContentLoaded',init);
+}else{
+init();
+}
+})();
+</script>
+</body>
+</html>
